@@ -3,11 +3,13 @@ import { readFileSync } from 'fs';
 import { parse } from '@babel/parser';
 import { declare } from '@babel/helper-plugin-utils';
 import resolve from 'resolve/sync';
+import generate from '@babel/generator';
 
 import optimize from './optimize';
 import escapeBraces from './escapeBraces';
 import transformSvg from './transformSvg';
 import fileExistsWithCaseSync from './fileExistsWithCaseSync';
+import { hyphenToCamel } from './camelize';
 
 let ignoreRegex;
 
@@ -19,29 +21,137 @@ export default declare(({
 }) => {
   assertVersion(7);
 
+  const specialPattern = (name) => /^data-|^aria-/.test(name);
+
+  const createObjectExpressions = (prop) => {
+    const resultArray = prop.value.expression.properties.map((property) => {
+      let value;
+
+      if (/^\d$/gi.test(property.value.value)) {
+        value = t.numericLiteral(parseInt(property.value.value, 10));
+      } else {
+        value = t.stringLiteral(property.value.value);
+      }
+
+      return t.objectProperty(
+        t.identifier(property.key.name),
+        value,
+      );
+    });
+
+    return t.objectExpression(resultArray);
+  };
+
+  const defaultValueTemplate = ({ name, identifier, defaultValue }) => {
+    let variable;
+    if (specialPattern(name)) {
+      variable = t.objectProperty(
+        t.stringLiteral(name),
+        t.assignmentPattern(
+          identifier,
+          defaultValue,
+        ),
+        false,
+        true, // shorthand
+      );
+    } else {
+      variable = t.objectProperty(
+        t.identifier(name),
+        t.assignmentPattern(
+          identifier,
+          defaultValue,
+        ),
+        false,
+        true, // shorthand
+      );
+    }
+
+    return variable;
+  };
+
   const buildSvg = ({
     IS_EXPORT,
     EXPORT_FILENAME,
     SVG_NAME,
-    SVG_CODE,
-    SVG_DEFAULT_PROPS_CODE,
+    SVG_CODE: tempSvgCode,
   }) => {
+    const SVG_CODE = tempSvgCode;
+    const keepProps = [];
+    const jsxKeepProps = [];
+
+    const objectPattern = [];
+    let jsxObjectPattern = [];
+
+    SVG_CODE.openingElement.attributes.forEach((prop) => {
+      if (prop.type === 'JSXSpreadAttribute') {
+        keepProps.push(t.restElement(t.identifier(prop.argument.name)));
+        jsxKeepProps.push(prop);
+        return;
+      }
+      let defaultValue;
+
+      if (prop.value.type === 'JSXExpressionContainer') {
+        defaultValue = createObjectExpressions(prop);
+      } else {
+        defaultValue = prop.value;
+      }
+
+      objectPattern.push(defaultValueTemplate({
+        name: prop.name.name.replace(/'/gi, ''),
+        identifier: t.identifier(hyphenToCamel(prop.name.name).replace(/'/gi, '')),
+        defaultValue,
+      }));
+
+      jsxObjectPattern.push(
+        t.jsxAttribute(
+          t.jsxIdentifier(prop.name.name),
+          t.jsxExpressionContainer(t.identifier(hyphenToCamel(prop.name.name).replace(/'/gi, ''))),
+        ),
+      );
+    });
+    jsxObjectPattern = jsxObjectPattern.concat(jsxKeepProps);
+
+    const blockStatement = t.blockStatement([
+      t.returnStatement(t.identifier('SVG_CODE')),
+    ]);
+    const objectPatternList = objectPattern.concat(keepProps);
+    const functionName = t.identifier('SVG_NAME');
+    const namedFunctionDeclaration = t.functionDeclaration(
+      functionName, // No name for the function (anonymous)
+      [t.objectPattern(objectPatternList)],
+      blockStatement,
+    );
+
+    const anonymousFunctionDeclaration = t.functionDeclaration(
+      null, // No name for the function (anonymous)
+      [t.objectPattern(objectPatternList)],
+      blockStatement,
+    );
+    SVG_CODE.openingElement.attributes = jsxObjectPattern;
+
     const namedTemplate = `
-      var SVG_NAME = function SVG_NAME(props) { return SVG_CODE; };
-      ${SVG_DEFAULT_PROPS_CODE ? 'SVG_NAME.defaultProps = SVG_DEFAULT_PROPS_CODE;' : ''}
+      var SVG_NAME = ${generate(namedFunctionDeclaration, {
+    jsescOption: {
+      quotes: 'single',
+    },
+  }, '').code};
       ${IS_EXPORT ? 'export { SVG_NAME };' : ''}
     `;
+
     const anonymousTemplate = `
-      var Component = function (props) { return SVG_CODE; };
-      ${SVG_DEFAULT_PROPS_CODE ? 'Component.defaultProps = SVG_DEFAULT_PROPS_CODE;' : ''}
+      var Component = ${generate(anonymousFunctionDeclaration, {
+    jsescOption: {
+      quotes: 'single',
+    },
+  }, '').code};
       Component.displayName = 'EXPORT_FILENAME';
       export default Component;
     `;
 
     if (SVG_NAME !== 'default') {
-      return template(namedTemplate)({ SVG_NAME, SVG_CODE, SVG_DEFAULT_PROPS_CODE });
+      return template(namedTemplate)({ SVG_NAME, SVG_CODE });
     }
-    return template(anonymousTemplate)({ SVG_CODE, SVG_DEFAULT_PROPS_CODE, EXPORT_FILENAME });
+    return template(anonymousTemplate)({ SVG_CODE, EXPORT_FILENAME });
   };
 
   function applyPlugin(importIdentifier, importPath, path, state, isExport, exportFilename) {
@@ -87,7 +197,6 @@ export default declare(({
       traverse(parsedSvgAst, transformSvg(t));
 
       const svgCode = traverse.removeProperties(parsedSvgAst.program.body[0].expression);
-
       const opts = {
         SVG_NAME: importIdentifier,
         SVG_CODE: svgCode,
@@ -95,28 +204,8 @@ export default declare(({
         EXPORT_FILENAME: exportFilename,
       };
 
-      // Move props off of element and into defaultProps
-      if (svgCode.openingElement.attributes.length > 1) {
-        const keepProps = [];
-        const defaultProps = [];
-
-        svgCode.openingElement.attributes.forEach((prop) => {
-          if (prop.type === 'JSXSpreadAttribute') {
-            keepProps.push(prop);
-          } else if (prop.value.type === 'JSXExpressionContainer') {
-            const objectExpression = t.objectExpression(prop.value.expression.properties);
-            defaultProps.push(t.objectProperty(t.identifier(prop.name.name), objectExpression));
-          } else {
-            defaultProps.push(t.objectProperty(t.identifier(prop.name.name), prop.value));
-          }
-        });
-
-        svgCode.openingElement.attributes = keepProps;
-        opts.SVG_DEFAULT_PROPS_CODE = t.objectExpression(defaultProps);
-      }
-
       const svgReplacement = buildSvg(opts);
-      if (opts.SVG_DEFAULT_PROPS_CODE) {
+      if (Array.isArray(svgReplacement)) {
         [newPath] = path.replaceWithMultiple(svgReplacement);
       } else {
         newPath = path.replaceWith(svgReplacement);
