@@ -27,7 +27,7 @@ export default declare(({
     const resultArray = prop.value.expression.properties.map((property) => {
       let value;
 
-      if (/^\d$/gi.test(property.value.value)) {
+      if (/^\d*$/gi.test(property.value.value)) {
         value = t.numericLiteral(parseInt(property.value.value, 10));
       } else {
         value = t.stringLiteral(property.value.value);
