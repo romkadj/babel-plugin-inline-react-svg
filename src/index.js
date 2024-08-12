@@ -23,15 +23,20 @@ export default declare(({
 
   const specialPattern = (name) => /^data-|^aria-/.test(name);
 
+  const formatValue = (property) => {
+    let value;
+    if (/^\d*$/gi.test(property.value.value)) {
+      value = t.numericLiteral(parseInt(property.value.value, 10));
+    } else {
+      value = t.stringLiteral(property.value.value);
+    }
+
+    return value;
+  };
+
   const createObjectExpressions = (prop) => {
     const resultArray = prop.value.expression.properties.map((property) => {
-      let value;
-
-      if (/^\d*$/gi.test(property.value.value)) {
-        value = t.numericLiteral(parseInt(property.value.value, 10));
-      } else {
-        value = t.stringLiteral(property.value.value);
-      }
+      const value = formatValue(property);
 
       return t.objectProperty(
         t.identifier(property.key.name),
@@ -93,7 +98,7 @@ export default declare(({
       if (prop.value.type === 'JSXExpressionContainer') {
         defaultValue = createObjectExpressions(prop);
       } else {
-        defaultValue = prop.value;
+        defaultValue = formatValue(prop);
       }
 
       objectPattern.push(defaultValueTemplate({
